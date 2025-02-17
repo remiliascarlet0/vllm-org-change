@@ -168,6 +168,39 @@ class LlamaAttention(nn.Module):
                                 self.kv_scale)
         output, _ = self.o_proj(attn_output)
         return output
+    
+
+class HcacheLlamaAttention(LlamaAttention):
+     def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: torch.Tensor,  # shape: (num_blocks, block_size, hidden_dim)
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        qkv,_ = self.qkv_proj(hidden_states)
+        q, k , v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        if kv_cache is not None:
+            # shape: (num_blocks, block_size, hidden_dim)
+            num_block, block_size,hidden_dim = kv_cache.size()
+            flattened_hidden = kv_cache.reshape(-1, hidden_dim)
+
+            historical_qkv,_ = self.qkv_proj(flattened_hidden)
+            _, k_hist, v_hist = historical_qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1)
+            
+            k_hist = k_hist.reshape(num_block, block_size,-1)
+            v_hist = v_hist.reshape(num_block, block_size,-1)
+
+            computed_kv = torch.cat([k_hist,v_hist],dim=0)
+        else:
+            computed_kv = None
+        
+        q,k = self.rotary_emb(positions, q, k)
+        atten_output = self.attn(q, k, v, computed_kv, attn_metadata, self.kv_scale)
+        output,_ = self.o_proj(atten_output)
+        return output
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -192,7 +225,19 @@ class LlamaDecoderLayer(nn.Module):
         # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
-        self.self_attn = LlamaAttention(
+        # self.self_attn = LlamaAttention(
+        #     hidden_size=self.hidden_size,
+        #     num_heads=config.num_attention_heads,
+        #     num_kv_heads=getattr(config, "num_key_value_heads",
+        #                          config.num_attention_heads),
+        #     rope_theta=rope_theta,
+        #     rope_scaling=rope_scaling,
+        #     max_position_embeddings=max_position_embeddings,
+        #     quant_config=quant_config,
+        #     bias=attention_bias,
+        #     sliding_window=sliding_window,
+        # )
+        self.self_attn = HcacheLlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=getattr(config, "num_key_value_heads",

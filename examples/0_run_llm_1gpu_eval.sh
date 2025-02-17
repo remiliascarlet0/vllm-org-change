@@ -16,15 +16,15 @@ export TORCH_USE_CUDA_DSA=1
 # preemption_mode=swap # 1: swap 2: recomputation
 gpu_id=3
 tensor_parallel_size=1
-gpu_memory_utilizations=(0.1)
+# gpu_memory_utilizations=(0.3)
 # gpu_memory_utilizations=(0.2)
-# gpu_memory_utilizations=(0.4)
+gpu_memory_utilizations=(0.4)
 # gpu_memory_utilizations=(0.5)
 preemption_mode=swap
 
 # models=(facebook/opt-30b meta-llama/Llama-2-7b-hf meta-llama/Llama-2-13b-hf)
-models=(facebook/opt-2.7b)
-# models=(meta-llama/Llama-2-7b-hf)
+# models=(facebook/opt-2.7b)
+models=(meta-llama/Llama-2-7b-hf)
 # models=(meta-llama/Llama-2-13b-hf)
 # request_rates=(50 100 150 200 250 300)
 request_rates=(300) 
@@ -60,7 +60,7 @@ for i in {1..1}; do
                     --gpu-memory-utilization ${gpu_memory_utilization} \
                     --max-num-seqs ${max_num_seqs} \
                     --enable-chunked-prefill \
-                    --disable-log-requests > ./${model_name}_server_${gpu_memory_utilization}_${request_rate}_${num_prompt}_${preemption_mode}_1.0_${tensor_parallel_size}gpu.log & 
+                    --disable-log-requests > logs/${model_name}_server_${gpu_memory_utilization}_${request_rate}_${num_prompt}_${preemption_mode}_1.0_${tensor_parallel_size}gpu.log & 
                 pid=$!    
                 wait_for_server 8080
                 sleep 1
@@ -72,8 +72,8 @@ for i in {1..1}; do
                     --request-rate ${request_rate} \
                     --num-prompts ${num_prompt} \
                     --save-result \
-                    --result-dir results/swap_recompute \
-                    --endpoint /v1/completions >> ./${model_name}_client_${gpu_memory_utilization}_${request_rate}_${num_prompt}_${preemption_mode}_1.0_${tensor_parallel_size}gpu.log 
+                    --result-dir logs \
+                    --endpoint /v1/completions >> logs/${model_name}_client_${gpu_memory_utilization}_${request_rate}_${num_prompt}_${preemption_mode}_1.0_${tensor_parallel_size}gpu.log 
                 kill -9 $pid 
                 sleep 1
             done

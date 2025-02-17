@@ -19,7 +19,9 @@ from vllm.distributed.device_communicators.custom_all_reduce import (
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.sequence import ExecuteModelRequest, SamplerOutput
-from vllm.worker.cache_engine import CacheEngine
+#================================================================================================
+from vllm.worker.cache_engine import CacheEngine,HiddenStateCacheEngine
+#================================================================================================
 from vllm.worker.model_runner import ModelRunner
 from vllm.worker.worker_base import WorkerBase
 
@@ -46,6 +48,7 @@ class Worker(WorkerBase):
         lora_config: Optional[LoRAConfig] = None,
         vision_language_config: Optional[VisionLanguageConfig] = None,
         is_driver_worker: bool = False,
+        use_hcache: bool = False,#new
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -83,7 +86,10 @@ class Worker(WorkerBase):
         )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
-        self.cache_engine: CacheEngine
+        #================================================================================================
+        # self.cache_engine: CacheEngine
+        self.cache_engine:HiddenStateCacheEngine
+        #================================================================================================
         self.gpu_cache: List[torch.Tensor]
 
     def init_device(self) -> None:
@@ -179,12 +185,25 @@ class Worker(WorkerBase):
         self._init_cache_engine()
         self._warm_up_model()
 
+    # def _init_cache_engine(self):
+    #     assert self.cache_config.num_gpu_blocks is not None
+    #     self.cache_engine = CacheEngine(self.cache_config, self.model_config,
+    #                                     self.parallel_config)
+    #     self.gpu_cache = self.cache_engine.gpu_cache
+    #     self.model_runner.set_block_size(self.cache_engine.block_size)
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
-        self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-                                        self.parallel_config)
+        # 使用HiddenStateCacheEngine替代原来的CacheEngine 
+        print(f'cache_engine HiddenStateCacheEngine is initializing') 
+        self.cache_engine = HiddenStateCacheEngine(
+            self.cache_config, 
+            self.model_config,
+            self.parallel_config
+        )
+        print(f'cache_engine: {self.cache_engine} HiddenStateCacheEngine has been suceessfully initialized') 
         self.gpu_cache = self.cache_engine.gpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
+
 
     def _warm_up_model(self) -> None:
         if not self.model_config.enforce_eager:
@@ -270,12 +289,20 @@ class Worker(WorkerBase):
     def vocab_size(self) -> int:
         return self.model_runner.vocab_size
 
+    # def get_cache_block_size_bytes(self) -> int:
+    #     """Get the size of the KV cache block size in bytes.
+    #     """
+    #     return CacheEngine.get_cache_block_size(self.cache_config,
+    #                                             self.model_config,
+    #                                             self.parallel_config)
     def get_cache_block_size_bytes(self) -> int:
         """Get the size of the KV cache block size in bytes.
         """
-        return CacheEngine.get_cache_block_size(self.cache_config,
-                                                self.model_config,
-                                                self.parallel_config)
+        # 修改为调用HiddenStateCacheEngine的方法
+        return HiddenStateCacheEngine.get_cache_block_size(
+            self.cache_config,
+            self.model_config,
+            self.parallel_config)
 
 
 def init_worker_distributed_environment(
