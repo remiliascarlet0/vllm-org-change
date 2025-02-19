@@ -170,6 +170,7 @@ class XFormersImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: Optional[torch.Tensor],
+        # hidden_cache: Optional[torch.Tensor],  # 改为hidden_cache
         attn_metadata: AttentionMetadata[XFormersMetadata],
         kv_scale: float,
     ) -> torch.Tensor:
@@ -201,6 +202,18 @@ class XFormersImpl(AttentionImpl):
                                                 attn_metadata.slot_mapping,
                                                 attn_metadata.kv_cache_dtype,
                                                 kv_scale)
+        # if hidden_cache is not None:
+        #     # 获取当前的hidden states
+        #     current_hidden = query.reshape(-1, hidden_size)
+            
+        #     # 将hidden states写入缓存
+        #     PagedAttention.write_to_paged_cache(
+        #         hidden_states=current_hidden,
+        #         hidden_cache=hidden_cache,
+        #         slot_mapping=attn_metadata.slot_mapping,
+        #         dtype=attn_metadata.cache_dtype,
+        #         # scale=scale
+        #     )
 
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens

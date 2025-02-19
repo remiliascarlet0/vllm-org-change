@@ -169,37 +169,48 @@ class LlamaAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
     
-
 class HcacheLlamaAttention(LlamaAttention):
-     def forward(
+    def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,  # shape: (num_blocks, block_size, hidden_dim)
+        hidden_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        qkv,_ = self.qkv_proj(hidden_states)
-        q, k , v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        if kv_cache is not None:
-            # shape: (num_blocks, block_size, hidden_dim)
-            num_block, block_size,hidden_dim = kv_cache.size()
-            flattened_hidden = kv_cache.reshape(-1, hidden_dim)
-
-            historical_qkv,_ = self.qkv_proj(flattened_hidden)
-            _, k_hist, v_hist = historical_qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1)
+        """前向传播，从 hidden states 计算注意力。
+        
+        Args:
+            positions: 位置编码
+            hidden_states: 当前 token 的隐藏状态，shape (batch_size, seq_len, hidden_dim)
+            hidden_cache: 历史 token 的隐藏状态，shape (num_blocks, block_size, hidden_dim)
+            attn_metadata: 注意力的元数据
+        """
+        # 1. 为当前 token 计算 QKV
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        # 2. 从 hidden states 重新计算历史 token 的 KV
+        if hidden_cache is not None:
+            # hidden_cache 已经是正确的形状: (num_blocks, block_size, hidden_dim)
+            num_blocks, block_size, _ = hidden_cache.shape
             
-            k_hist = k_hist.reshape(num_block, block_size,-1)
-            v_hist = v_hist.reshape(num_block, block_size,-1)
-
-            computed_kv = torch.cat([k_hist,v_hist],dim=0)
+            # 计算历史 token 的 KV
+            historical_qkv, _ = self.qkv_proj(hidden_cache)
+            _, k_hist, v_hist = historical_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            
+            # 创建符合 PagedAttention 预期的 KV cache 格式
+            computed_kv = torch.stack([k_hist, v_hist], dim=0)
         else:
             computed_kv = None
+            
+        # 3. 应用 RoPE 位置编码
+        q, k = self.rotary_emb(positions, q, k)
         
-        q,k = self.rotary_emb(positions, q, k)
-        atten_output = self.attn(q, k, v, computed_kv, attn_metadata, self.kv_scale)
-        output,_ = self.o_proj(atten_output)
+        # 4. 计算注意力输出
+        attn_output = self.attn(q, k, v, computed_kv, attn_metadata, self.kv_scale)
+        
+        # 5. 输出投影
+        output, _ = self.o_proj(attn_output)
         return output
 
 
@@ -278,7 +289,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
+            hidden_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
 

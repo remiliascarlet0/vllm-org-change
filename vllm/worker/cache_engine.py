@@ -110,33 +110,22 @@ class HiddenStateCacheEngine(CacheEngine):
         num_blocks: int,
         device: str,
     ) -> List[torch.Tensor]:
-        """分配hidden states缓存空间。
+        """分配 hidden states 缓存空间。
         
-        Args:
-            num_blocks: 区块数量
-            device: 设备类型("cpu"或"cuda")
-            
-        Returns:
-            hidden_cache: 每层的hidden states缓存列表
+        每个区块存储 block_size 个 token 的 hidden states。
+        每个 token 的 hidden state 维度是 hidden_dim。
         """
         if num_blocks == 0:
             return []
             
+        # 获取隐藏层维度
         hidden_dim = self.model_config.get_hidden_size()
         
-        # 重要：保持vLLM的block结构
-        # block_size必须为8,16或32，这是CUDA kernel的要求
-        # shape为(num_blocks, block_size, hidden_dim)
-        # - num_blocks: 区块数量 
-        # - block_size: 每个区块中的token数量(8/16/32)
-        # - hidden_dim: hidden state的维度
+        # 形状应该是: (num_blocks, block_size, hidden_dim)
+        # - num_blocks: 区块数量
+        # - block_size: 每个区块存储的 token 数量
+        # - hidden_dim: 每个 token 的 hidden state 维度
         shape = (num_blocks, self.block_size, hidden_dim)
-        
-        print(f"Debug info:")
-        print(f"  num_blocks: {num_blocks}")
-        print(f"  block_size: {self.block_size}")
-        print(f"  hidden_dim: {hidden_dim}")
-        print(f"  Allocating shape: {shape}")
         
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         
@@ -148,56 +137,28 @@ class HiddenStateCacheEngine(CacheEngine):
                           pin_memory=pin_memory,
                           device=device))
         return hidden_cache
- 
+
+    @staticmethod
     def get_cache_block_size(
         cache_config: CacheConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ) -> int:
-        """计算hidden states缓存块大小
+        """计算 hidden states 缓存块大小。
         
-        Args:
-            cache_config: 缓存配置
-            model_config: 模型配置 
-            parallel_config: 并行配置
-
-        Returns:
-            block_size: 以字节为单位的块大小
-        """
-        # hidden_size = model_config.get_hidden_size()
-        # num_layers = model_config.get_num_layers(parallel_config)
-
-        # block_size = max(8, cache_config.block_size)
-        # if block_size not in [8,16,32]:
-        #     block_size = 8 * ((block_size+7) //8)
-        #     block_size = min(block_size, 32)
-        
-        # hidden_block = block_size * hidden_size
-        # total = num_layers * hidden_block
-
-        # if cache_config.cache_dtype == "auto":
-        #     dtype = model_config.dtype
-        # else:
-        #     dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-        # dtype_size = _get_dtype_size(dtype)
-
-        # return dtype_size * total
-
-        """重新计算block size
-        
-        现在是基于hidden states而不是KV cache来计算
+        这里只需要存储 hidden states，不需要存储 K 和 V。
         """
         hidden_size = model_config.get_hidden_size()
         num_layers = model_config.get_num_layers(parallel_config)
         
-        # 每个block只需要存储hidden states
+        # 每个区块存储 block_size 个 token 的 hidden states
         hidden_block = cache_config.block_size * hidden_size
         total = num_layers * hidden_block
 
         if cache_config.cache_dtype == "auto":
             dtype = model_config.dtype
         else:
-            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype] 
+            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
         dtype_size = _get_dtype_size(dtype)
         
         return dtype_size * total

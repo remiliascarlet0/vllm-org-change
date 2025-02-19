@@ -214,6 +214,66 @@ __global__ void reshape_and_cache_kernel(
     }
   }
 }
+//==============================================================================
+// CUDA kernel实现
+__global__ void reshape_and_cache_hidden_kernel(
+    const float* __restrict__ hidden_states,     // 输入hidden states
+    float* __restrict__ hidden_cache,            // 目标缓存
+    const int* __restrict__ slot_mapping,        // 槽位映射
+    const int hidden_size,                       // hidden state大小
+    const int block_size,                        // 每个block的大小
+    const float scale = 1.0f                     // 可选的缩放因子
+) {
+    // 获取当前线程处理的token索引
+    const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // 获取slot位置
+    const int slot = slot_mapping[token_idx];
+    if (slot < 0) return;  // 无效的slot
+    
+    // 计算目标block和offset
+    const int target_block = slot / block_size;
+    const int block_offset = slot % block_size;
+    
+    // 复制hidden state到缓存
+    const int hidden_idx = token_idx * hidden_size;
+    const int cache_idx = target_block * block_size * hidden_size + 
+                         block_offset * hidden_size;
+    
+    // 逐个复制hidden dimension
+    for (int i = 0; i < hidden_size; i++) {
+        hidden_cache[cache_idx + i] = hidden_states[hidden_idx + i] * scale;
+    }
+}
+
+// C++ 接口
+void reshape_and_cache_hidden(
+    torch::Tensor& hidden_states,
+    torch::Tensor& hidden_cache,
+    torch::Tensor& slot_mapping,
+    const std::string& dtype,
+    float scale
+) {
+    // 获取tensor信息
+    const int num_tokens = hidden_states.size(0);
+    const int hidden_size = hidden_states.size(1);
+    const int block_size = hidden_cache.size(1);
+    
+    // 设置CUDA kernel参数
+    const int threads_per_block = 256;
+    const int num_blocks = (num_tokens + threads_per_block - 1) / threads_per_block;
+    
+    // 启动kernel
+    reshape_and_cache_hidden_kernel<<<num_blocks, threads_per_block>>>(
+        hidden_states.data_ptr<float>(),
+        hidden_cache.data_ptr<float>(),
+        slot_mapping.data_ptr<int>(),
+        hidden_size,
+        block_size,
+        scale
+    );
+}
+
 
 template<typename scalar_t>
 __global__ void reshape_and_cache_flash_kernel(

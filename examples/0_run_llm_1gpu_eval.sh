@@ -14,7 +14,7 @@ export TORCH_USE_CUDA_DSA=1
 # pgrep -f 'api_server' | xargs kill -9
 
 # preemption_mode=swap # 1: swap 2: recomputation
-gpu_id=3
+gpu_id=1
 tensor_parallel_size=1
 # gpu_memory_utilizations=(0.3)
 # gpu_memory_utilizations=(0.2)
@@ -36,7 +36,7 @@ wait_for_server() {
     local port=$1
     while true; do
         if netstat -tulnp | grep -q "${port}"; then
-            echo "server is running on port ${port}"
+            echo "server is running on port ${port}"    
             break
         else
             echo "server is not running on port ${port}"

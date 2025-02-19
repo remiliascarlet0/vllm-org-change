@@ -77,6 +77,30 @@ class PagedAttention:
             kv_cache_dtype,
             kv_scale,
         )
+    # @staticmethod
+    # def write_to_paged_cache(
+    #     hidden_states: torch.Tensor,  # 改为hidden states输入
+    #     hidden_cache: torch.Tensor,   # 改为hidden cache
+    #     slot_mapping: torch.Tensor,
+    #     dtype: str,                   # hidden states的数据类型
+    #     scale: float = 1.0,          # 可选的缩放因子
+    # ) -> None:
+    #     """将hidden states写入分页缓存。
+        
+    #     Args:
+    #         hidden_states: 要缓存的hidden states
+    #         hidden_cache: 目标缓存tensor
+    #         slot_mapping: 槽位映射
+    #         dtype: 缓存的数据类型
+    #         scale: 可选的缩放因子(主要用于量化)
+    #     """
+    #     ops.reshape_and_cache_hidden(
+    #         hidden_states,
+    #         hidden_cache, 
+    #         slot_mapping.flatten(),
+    #         dtype,
+    #         scale,
+    #     )
 
     @staticmethod
     def forward_decode(
