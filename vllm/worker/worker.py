@@ -191,16 +191,36 @@ class Worker(WorkerBase):
     #                                     self.parallel_config)
     #     self.gpu_cache = self.cache_engine.gpu_cache
     #     self.model_runner.set_block_size(self.cache_engine.block_size)
+    # def _init_cache_engine(self):
+    #     assert self.cache_config.num_gpu_blocks is not None
+    #     # 使用HiddenStateCacheEngine替代原来的CacheEngine 
+    #     print(f'cache_engine HiddenStateCacheEngine is initializing') 
+    #     self.cache_engine = HiddenStateCacheEngine(
+    #         self.cache_config, 
+    #         self.model_config,
+    #         self.parallel_config
+    #     )
+    #     print(f'cache_engine: {self.cache_engine} HiddenStateCacheEngine has been suceessfully initialized') 
+    #     self.gpu_cache = self.cache_engine.gpu_cache
+    #     self.model_runner.set_block_size(self.cache_engine.block_size)
     def _init_cache_engine(self):
+        """初始化缓存引擎
+        
+        使用HiddenStateCacheEngine替代原始的CacheEngine，
+        以实现基于hidden states的缓存机制。
+        """
         assert self.cache_config.num_gpu_blocks is not None
+        
         # 使用HiddenStateCacheEngine替代原来的CacheEngine 
-        print(f'cache_engine HiddenStateCacheEngine is initializing') 
+        print("Initializing HiddenStateCacheEngine...")
         self.cache_engine = HiddenStateCacheEngine(
             self.cache_config, 
             self.model_config,
             self.parallel_config
         )
-        print(f'cache_engine: {self.cache_engine} HiddenStateCacheEngine has been suceessfully initialized') 
+        print(f"HiddenStateCacheEngine initialized successfully with {self.cache_config.num_gpu_blocks} GPU blocks")
+        
+        # 保持与原有实现的一致性
         self.gpu_cache = self.cache_engine.gpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
 
