@@ -215,65 +215,68 @@ __global__ void reshape_and_cache_kernel(
   }
 }
 //==============================================================================
-// CUDA kernel实现
-__global__ void reshape_and_cache_hidden_kernel(
-    const float* __restrict__ hidden_states,     // 输入hidden states
-    float* __restrict__ hidden_cache,            // 目标缓存
-    const int* __restrict__ slot_mapping,        // 槽位映射
-    const int hidden_size,                       // hidden state大小
-    const int block_size,                        // 每个block的大小
-    const float scale = 1.0f                     // 可选的缩放因子
+// 在paged_attention.cpp中添加
+void reshape_and_cache_hidden(
+    torch::Tensor& hidden_states,     // [num_tokens, hidden_dim]
+    torch::Tensor& hidden_cache,      // [1, num_blocks, block_size, hidden_dim]
+    torch::Tensor& slot_mapping       // [num_tokens]
 ) {
-    // 获取当前线程处理的token索引
-    const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_tokens = hidden_states.size(0);
+    int hidden_dim = hidden_states.size(1);
+    int block_size = hidden_cache.size(2);
     
-    // 获取slot位置
-    const int slot = slot_mapping[token_idx];
-    if (slot < 0) return;  // 无效的slot
+    int hidden_stride = hidden_states.stride(0);
+    
+    dim3 grid(num_tokens);
+    dim3 block(std::min(hidden_dim, 512));
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(hidden_states));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    
+    VLLM_DISPATCH_FLOATING_TYPES(
+        hidden_states.scalar_type(),
+        "reshape_and_cache_hidden",
+        [&] {
+            vllm::reshape_and_cache_hidden_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                hidden_states.data_ptr<scalar_t>(),
+                hidden_cache.data_ptr<scalar_t>(),
+                slot_mapping.data_ptr<int64_t>(),
+                hidden_stride,
+                hidden_dim,
+                block_size);
+        });
+}
+
+namespace vllm {
+
+template<typename scalar_t>
+__global__ void reshape_and_cache_hidden_kernel(
+    const scalar_t* __restrict__ hidden_states,  // [num_tokens, hidden_dim]
+    scalar_t* __restrict__ hidden_cache,         // [1, num_blocks, block_size, hidden_dim]
+    const int64_t* __restrict__ slot_mapping,    // [num_tokens]
+    const int hidden_stride,
+    const int hidden_dim,
+    const int block_size) {
+    const int64_t token_idx = blockIdx.x;
+    const int64_t slot_idx = slot_mapping[token_idx];
+    // 如果是填充token则忽略
+    if (slot_idx < 0) {
+        return;
+    }
     
     // 计算目标block和offset
-    const int target_block = slot / block_size;
-    const int block_offset = slot % block_size;
+    const int64_t block_idx = slot_idx / block_size;
+    const int64_t block_offset = slot_idx % block_size;
     
-    // 复制hidden state到缓存
-    const int hidden_idx = token_idx * hidden_size;
-    const int cache_idx = target_block * block_size * hidden_size + 
-                         block_offset * hidden_size;
-    
-    // 逐个复制hidden dimension
-    for (int i = 0; i < hidden_size; i++) {
-        hidden_cache[cache_idx + i] = hidden_states[hidden_idx + i] * scale;
+    // 拷贝hidden states到缓存
+    for (int i = threadIdx.x; i < hidden_dim; i += blockDim.x) {
+        const int64_t src_idx = token_idx * hidden_stride + i;
+        const int64_t tgt_idx = block_idx * block_size * hidden_dim + 
+                               block_offset * hidden_dim + i;
+        hidden_cache[tgt_idx] = hidden_states[src_idx];
     }
 }
 
-// C++ 接口
-void reshape_and_cache_hidden(
-    torch::Tensor& hidden_states,
-    torch::Tensor& hidden_cache,
-    torch::Tensor& slot_mapping,
-    const std::string& dtype,
-    float scale
-) {
-    // 获取tensor信息
-    const int num_tokens = hidden_states.size(0);
-    const int hidden_size = hidden_states.size(1);
-    const int block_size = hidden_cache.size(1);
-    
-    // 设置CUDA kernel参数
-    const int threads_per_block = 256;
-    const int num_blocks = (num_tokens + threads_per_block - 1) / threads_per_block;
-    
-    // 启动kernel
-    reshape_and_cache_hidden_kernel<<<num_blocks, threads_per_block>>>(
-        hidden_states.data_ptr<float>(),
-        hidden_cache.data_ptr<float>(),
-        slot_mapping.data_ptr<int>(),
-        hidden_size,
-        block_size,
-        scale
-    );
-}
-
+} // namespace vllm
 
 template<typename scalar_t>
 __global__ void reshape_and_cache_flash_kernel(

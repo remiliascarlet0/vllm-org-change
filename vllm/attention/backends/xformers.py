@@ -197,11 +197,11 @@ class XFormersImpl(AttentionImpl):
             # Reshape the input keys and values and store them in the cache.
             # If kv_cache is not provided, the new key and value tensors are
             # not cached. This happens during the initial memory profiling run.
-            PagedAttention.write_to_paged_cache(key, value, key_cache,
-                                                value_cache,
-                                                attn_metadata.slot_mapping,
-                                                attn_metadata.kv_cache_dtype,
-                                                kv_scale)
+            # PagedAttention.write_to_paged_cache(key, value, key_cache,
+            #                                     value_cache,
+            #                                     attn_metadata.slot_mapping,
+            #                                     attn_metadata.kv_cache_dtype,
+            #                                     kv_scale)
         # if hidden_cache is not None:
         #     # 获取当前的hidden states
         #     current_hidden = query.reshape(-1, hidden_size)

@@ -48,7 +48,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_hip
-
+from vllm.attention.ops.paged_attn import PagedAttention
 
 class LlamaMLP(nn.Module):
 
@@ -277,6 +277,13 @@ class HcacheLlamaAttention(LlamaAttention):
         
         # 输出投影
         output, _ = self.o_proj(attn_output)
+        if attn_metadata.slot_mapping is not None:
+            # 调用新增方法存储hidden states
+            PagedAttention.write_hidden_to_paged_cache(
+                hidden_states,
+                hidden_cache,
+                attn_metadata.slot_mapping
+            )
         return output
 
 

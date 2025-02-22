@@ -78,29 +78,29 @@ class PagedAttention:
             kv_scale,
         )
     # @staticmethod
-    # def write_to_paged_cache(
-    #     hidden_states: torch.Tensor,  # 改为hidden states输入
-    #     hidden_cache: torch.Tensor,   # 改为hidden cache
-    #     slot_mapping: torch.Tensor,
-    #     dtype: str,                   # hidden states的数据类型
-    #     scale: float = 1.0,          # 可选的缩放因子
-    # ) -> None:
-    #     """将hidden states写入分页缓存。
+    @staticmethod
+    def write_hidden_to_paged_cache(
+        hidden_states: torch.Tensor,  # [num_tokens, hidden_dim]
+        hidden_cache: torch.Tensor,   # [1, num_blocks, block_size, hidden_dim]
+        slot_mapping: torch.Tensor,   # [num_tokens]
+    ) -> None:
+        """将hidden states写入到分页缓存中。
         
-    #     Args:
-    #         hidden_states: 要缓存的hidden states
-    #         hidden_cache: 目标缓存tensor
-    #         slot_mapping: 槽位映射
-    #         dtype: 缓存的数据类型
-    #         scale: 可选的缩放因子(主要用于量化)
-    #     """
-    #     ops.reshape_and_cache_hidden(
-    #         hidden_states,
-    #         hidden_cache, 
-    #         slot_mapping.flatten(),
-    #         dtype,
-    #         scale,
-    #     )
+        Args:
+            hidden_states: 需要缓存的hidden states
+            hidden_cache: hidden states缓存
+            slot_mapping: token到缓存槽位的映射
+        """
+        if slot_mapping is None or hidden_cache is None:
+            return
+            
+
+        # 调用CUDA核函数来写入hidden states
+        ops.reshape_and_cache_hidden(
+            hidden_states,
+            hidden_cache,
+            slot_mapping
+        )
 
     @staticmethod
     def forward_decode(
