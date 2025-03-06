@@ -104,68 +104,12 @@ class CacheEngine:
 def _get_dtype_size(dtype: torch.dtype) -> int:
     return torch.tensor([], dtype=dtype).element_size()
 #================================================================================================
-# class HiddenStateCacheEngine(CacheEngine):
-#     def _allocate_kv_cache(
-#         self,
-#         num_blocks: int,
-#         device: str,
-#     ) -> List[torch.Tensor]:
-#         """分配 hidden states 缓存空间。
-        
-#         每个区块存储 block_size 个 token 的 hidden states。
-#         每个 token 的 hidden state 维度是 hidden_dim。
-#         """
-#         if num_blocks == 0:
-#             return []
-            
-#         # 获取隐藏层维度
-#         hidden_dim = self.model_config.get_hidden_size()
-        
-#         # 形状应该是: (num_blocks, block_size, hidden_dim)
-#         # - num_blocks: 区块数量
-#         # - block_size: 每个区块存储的 token 数量
-#         # - hidden_dim: 每个 token 的 hidden state 维度
-#         shape = (num_blocks, self.block_size, hidden_dim)
-        
-#         pin_memory = is_pin_memory_available() if device == "cpu" else False
-        
-#         hidden_cache: List[torch.Tensor] = []
-#         for _ in range(self.num_layers):
-#             hidden_cache.append(
-#                 torch.empty(shape,
-#                           dtype=self.dtype,
-#                           pin_memory=pin_memory,
-#                           device=device))
-#         return hidden_cache
 
-#     @staticmethod
-#     def get_cache_block_size(
-#         cache_config: CacheConfig,
-#         model_config: ModelConfig,
-#         parallel_config: ParallelConfig,
-#     ) -> int:
-#         """计算 hidden states 缓存块大小。
-        
-#         这里只需要存储 hidden states，不需要存储 K 和 V。
-#         """
-#         hidden_size = model_config.get_hidden_size()
-#         num_layers = model_config.get_num_layers(parallel_config)
-        
-#         # 每个区块存储 block_size 个 token 的 hidden states
-#         hidden_block = cache_config.block_size * hidden_size
-#         total = num_layers * hidden_block
-
-#         if cache_config.cache_dtype == "auto":
-#             dtype = model_config.dtype
-#         else:
-#             dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
-#         dtype_size = _get_dtype_size(dtype)
-        
-#         return dtype_size * total
 class HiddenStateCacheEngine(CacheEngine):
     """管理基于hidden states的缓存引擎，以减少内存消耗。
     
     通过存储模型的中间态(hidden states)而不是KV缓存，能够减少约50%的内存使用。
+    每两层共享一个缓存，进一步降低内存需求。
     """
 
     def _allocate_kv_cache(
@@ -180,27 +124,30 @@ class HiddenStateCacheEngine(CacheEngine):
             device: 设备类型("cpu"或"cuda")
             
         Returns:
-            hidden_cache: 每层的hidden states缓存列表
+            hidden_cache: 每两层共享的hidden states缓存列表
         """
         if num_blocks == 0:
             return []
             
-        # 获取hidden_dim，对应于transformer的隐藏层大小
+        # 获取hidden_dim
         hidden_dim = self.model_config.get_hidden_size()
         
-        # 使用与原始VLLM一致的块结构: (num_blocks, block_size, hidden_dim)
-        # 这样可以保持与PagedAttention机制的兼容性
-        shape = (num_blocks, self.block_size, hidden_dim)
+        # 使用与原始VLLM一致的块结构
+        # 注意：这里的形状仍然遵循KV缓存的形状，便于与PagedAttention兼容
+        kv_shape = self.attn_backend.get_kv_cache_shape(
+            num_blocks, self.block_size, self.num_heads, self.head_size)
         
-        logger.info(f"Allocating hidden states cache with shape {shape} on {device}")
+        logger.info(f"Allocating hidden states cache with shape {kv_shape} on {device}")
         
-        # 对CPU缓存使用pin_memory可加速GPU-CPU传输
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         
+        # 每两层共享一个缓存
+        num_caches = (self.num_layers + 1) // 2  # 向上取整，确保奇数层情况也正确处理
+        
         hidden_cache: List[torch.Tensor] = []
-        for _ in range(self.num_layers):
+        for _ in range(num_caches):
             hidden_cache.append(
-                torch.empty(shape,
+                torch.empty(kv_shape,
                           dtype=self.dtype,
                           pin_memory=pin_memory,
                           device=device))
@@ -215,8 +162,7 @@ class HiddenStateCacheEngine(CacheEngine):
     ) -> int:
         """计算hidden states缓存块大小
         
-        与原始KV缓存相比，hidden states只需存储一个张量而非K和V两个，
-        因此理论上内存使用减少了一半。
+        与原始KV缓存相比，每两层共享一个缓存，因此理论上内存使用减少约50%。
         
         Args:
             cache_config: 缓存配置
@@ -226,15 +172,15 @@ class HiddenStateCacheEngine(CacheEngine):
         Returns:
             block_size: 以字节为单位的块大小
         """
-        hidden_size = model_config.get_hidden_size()
+        head_size = model_config.get_head_size()
+        num_heads = model_config.get_num_kv_heads(parallel_config)
         num_layers = model_config.get_num_layers(parallel_config)
+        num_caches = (num_layers + 1) // 2  # 向上取整，确保奇数层情况也正确处理
         
-        # 计算每个块存储hidden states所需的内存
-        # 与KV缓存相比，内存减少一半
-        hidden_block = cache_config.block_size * hidden_size
-        total = num_layers * hidden_block
-
-        # 获取数据类型大小
+        key_cache_block = cache_config.block_size * num_heads * head_size
+        value_cache_block = key_cache_block
+        total = num_caches * (key_cache_block + value_cache_block)
+        
         if cache_config.cache_dtype == "auto":
             dtype = model_config.dtype
         else:
@@ -242,33 +188,3 @@ class HiddenStateCacheEngine(CacheEngine):
         dtype_size = _get_dtype_size(dtype)
         
         return dtype_size * total
-        
-    def swap_in(self, src_to_dst: Dict[int, int]) -> None:
-        """从CPU缓存交换hidden states到GPU缓存。
-        
-        与原始方法相比，这里只处理hidden states而不是K和V。
-        
-        Args:
-            src_to_dst: 源块到目标块的映射
-        """
-        for i in range(self.num_layers):
-            # 使用原始的swap_blocks方法，但只处理一个tensor而不是两个
-            ops.swap_blocks(self.cpu_cache[i], self.gpu_cache[i], src_to_dst)
-
-    def swap_out(self, src_to_dst: Dict[int, int]) -> None:
-        """从GPU缓存交换hidden states到CPU缓存。
-        
-        Args:
-            src_to_dst: 源块到目标块的映射
-        """
-        for i in range(self.num_layers):
-            ops.swap_blocks(self.gpu_cache[i], self.cpu_cache[i], src_to_dst)
-
-    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
-        """在GPU内复制hidden states块。
-        
-        Args:
-            src_to_dsts: 源块到目标块列表的映射
-        """
-        # 直接调用底层操作来复制hidden states块
-        ops.copy_blocks(self.gpu_cache, src_to_dsts)

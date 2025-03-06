@@ -48,7 +48,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_hip
-
+from vllm.attention.ops.paged_attn import PagedAttention
 
 class LlamaMLP(nn.Module):
 
@@ -93,6 +93,7 @@ class LlamaAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         sliding_window: Optional[int] = None,
+        
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -216,104 +217,195 @@ class LlamaAttention(nn.Module):
 class HcacheLlamaAttention(LlamaAttention):
     """使用hidden states缓存的Llama注意力层。
     
-    这个实现从hidden states高效地计算KV值，并与原有的注意力机制兼容。
+    复用现有KV缓存结构，但存储的是hidden states。
+    对于每两层共享的缓存：
+    - 偶数层的hidden states存储在K位置
+    - 奇数层的hidden states存储在V位置
     """
-    
+
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        hidden_cache: torch.Tensor,  # 注意：这里接收的是hidden states缓存而非KV缓存
+        hidden_states: torch.Tensor,  # [num_tokens, hidden_size]
+        kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        layer_idx: int = 0,
     ) -> torch.Tensor:
-        """前向传播计算。
-        
-        Args:
-            positions: 位置索引，用于rotary embedding
-            hidden_states: 当前token的hidden states
-            hidden_cache: 历史token的hidden states缓存 
-            attn_metadata: 注意力计算的元数据
-            
-        Returns:
-            attention输出
-        """
-        # 为当前token计算QKV
+        """从hidden states计算注意力。"""
+        # 1. 计算当前token的QKV
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         
-        # 从hidden缓存计算历史tokens的KV
+        # 2. 从缓存计算历史KV
         computed_kv = None
-        if hidden_cache is not None and hidden_cache.size(0) > 0:
-            # 获取缓存的形状信息
-            num_blocks = hidden_cache.size(0)
-            block_size = hidden_cache.size(1)
-            hidden_dim = hidden_cache.size(2)
-            print(f'num_blocks: {num_blocks}, block_size: {block_size}, hidden_dim: {hidden_dim}')
-            # 批量计算hidden states -> KV
-            # 展平所有块的hidden states为一个批次
-            flat_hidden = hidden_cache.reshape(-1, hidden_dim)
+        if kv_cache is not None:
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_dim)
             
-            # 使用与当前token相同的QKV投影计算历史token的KV
-            historical_qkv, _ = self.qkv_proj(flat_hidden)
+            # 根据层索引选择正确的缓存
+            # 偶数层的hidden states存在K位置，奇数层存在V位置
+            hidden_cache = key_cache if layer_idx % 2 == 0 else value_cache
             
-            # 只需要K和V部分
-            _, k_hist, v_hist = historical_qkv.split(
-                [self.q_size, self.kv_size, self.kv_size], dim=-1)
-            
-            # 重塑回块结构
-            k_hist = k_hist.view(num_blocks, block_size, -1)
-            v_hist = v_hist.view(num_blocks, block_size, -1)
-            
-            # 堆叠为vLLM期望的KV缓存格式
-            computed_kv = torch.stack([k_hist, v_hist], dim=0)
-            print(f'computed_kv: {computed_kv.shape}')
-        # 应用rotary position embeddings
+            if hidden_cache.size(0) > 0:
+                # 从缓存中获取hidden states
+                flat_hidden = hidden_cache.reshape(-1, self.hidden_size)
+                
+                # 计算historical KV
+                historical_qkv, _ = self.qkv_proj(flat_hidden)
+                _, k_hist, v_hist = historical_qkv.split(
+                    [self.q_size, self.kv_size, self.kv_size], dim=-1)
+                
+                # 重塑回缓存形状
+                k_hist = k_hist.reshape(hidden_cache.shape)
+                v_hist = v_hist.reshape(hidden_cache.shape)
+                
+                # 创建计算好的KV缓存
+                computed_kv = torch.stack([k_hist, v_hist], dim=0)
+        
+        # 3. 应用rotary position embeddings
         q, k = self.rotary_emb(positions, q, k)
         
-        # 使用原始attention机制
-        # 注意：这里我们直接传递computed_kv作为KV缓存
-        attn_output = self.attn(
-            q, k, v, computed_kv, attn_metadata, self.kv_scale)
+        # 4. 使用注意力机制
+        attn_output = self.attn(q, k, v, computed_kv, attn_metadata, self.kv_scale)
         
-        # 输出投影
+        # 5. 输出投影
         output, _ = self.o_proj(attn_output)
+        
+        # 6. 只有偶数层才存储hidden states到缓存
+        if kv_cache is not None and attn_metadata.slot_mapping is not None and layer_idx % 2 == 0:
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_dim)
+            
+            # 重要：将hidden_states重塑为PagedAttention期望的形状
+            # hidden_states已经是[num_tokens, hidden_size]
+            # 我们需要将其重塑为[num_tokens, num_kv_heads, head_dim]，与k和v相同
+            reshaped_hidden = hidden_states.view(-1, self.num_kv_heads * self.head_dim)
+            reshaped_output = output.view(-1, self.num_heads * self.head_dim)
+            
+            # 注意：这里我们用相同的hidden_states存储在K和V位置
+            # 这样下一层可以用V位置的来计算
+            PagedAttention.write_to_paged_cache(
+                reshaped_hidden,  # 当前层hidden states
+                reshaped_output,  # 同样是当前层hidden states
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                attn_metadata.kv_cache_dtype,
+                1.0
+            )
+        
         return output
 
 
+# class LlamaDecoderLayer(nn.Module):
+
+#     def __init__(
+#         self,
+#         config: LlamaConfig,
+#         quant_config: Optional[QuantizationConfig] = None,
+#         layer_index: int = 0,
+#     ) -> None:
+#         super().__init__()
+#         self.hidden_size = config.hidden_size
+#         rope_theta = getattr(config, "rope_theta", 10000)
+#         rope_scaling = getattr(config, "rope_scaling", None)
+#         if rope_scaling is not None and getattr(
+#                 config, "original_max_position_embeddings", None):
+#             rope_scaling["original_max_position_embeddings"] = (
+#                 config.original_max_position_embeddings)
+#         max_position_embeddings = getattr(config, "max_position_embeddings",
+#                                           8192)
+#         sliding_window = getattr(config, "sliding_window", None)
+#         # Support abacusai/Smaug-72B-v0.1 with attention_bias
+#         # Support internlm/internlm-7b with bias
+#         attention_bias = getattr(config, "attention_bias", False) or getattr(
+#             config, "bias", False)
+#         # self.self_attn = LlamaAttention(
+#         #     hidden_size=self.hidden_size,
+#         #     num_heads=config.num_attention_heads,
+#         #     num_kv_heads=getattr(config, "num_key_value_heads",
+#         #                          config.num_attention_heads),
+#         #     rope_theta=rope_theta,
+#         #     rope_scaling=rope_scaling,
+#         #     max_position_embeddings=max_position_embeddings,
+#         #     quant_config=quant_config,
+#         #     bias=attention_bias,
+#         #     sliding_window=sliding_window,
+#         # )
+#         self.index = layer_index
+#         self.self_attn = HcacheLlamaAttention(
+#             hidden_size=self.hidden_size,
+#             num_heads=config.num_attention_heads,
+#             num_kv_heads=getattr(config, "num_key_value_heads",
+#                                  config.num_attention_heads),
+#             rope_theta=rope_theta,
+#             rope_scaling=rope_scaling,
+#             max_position_embeddings=max_position_embeddings,
+#             quant_config=quant_config,
+#             bias=attention_bias,
+#             sliding_window=sliding_window,
+#         )
+#         self.mlp = LlamaMLP(
+#             hidden_size=self.hidden_size,
+#             intermediate_size=config.intermediate_size,
+#             hidden_act=config.hidden_act,
+#             quant_config=quant_config,
+#         )
+#         self.input_layernorm = RMSNorm(config.hidden_size,
+#                                        eps=config.rms_norm_eps)
+#         self.post_attention_layernorm = RMSNorm(config.hidden_size,
+#                                                 eps=config.rms_norm_eps)
+
+#     def forward(
+#         self,
+#         positions: torch.Tensor,
+#         hidden_states: torch.Tensor,
+#         kv_cache: torch.Tensor,
+#         attn_metadata: AttentionMetadata,
+#         residual: Optional[torch.Tensor],
+#     ) -> Tuple[torch.Tensor, torch.Tensor]:
+#         # Self Attention
+#         if residual is None:
+#             residual = hidden_states
+#             hidden_states = self.input_layernorm(hidden_states)
+#         else:
+#             hidden_states, residual = self.input_layernorm(
+#                 hidden_states, residual)
+#         hidden_states = self.self_attn(
+#             positions=positions,
+#             hidden_states=hidden_states,
+#             hidden_cache=kv_cache,
+#             attn_metadata=attn_metadata,
+#         )
+
+#         # Fully Connected
+#         hidden_states, residual = self.post_attention_layernorm(
+#             hidden_states, residual)
+#         hidden_states = self.mlp(hidden_states)
+#         return hidden_states, residual
+    
 class LlamaDecoderLayer(nn.Module):
 
     def __init__(
         self,
         config: LlamaConfig,
+        layer_idx: int = 0,  # 添加层索引参数
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx  # 保存层索引
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
                 config, "original_max_position_embeddings", None):
             rope_scaling["original_max_position_embeddings"] = (
                 config.original_max_position_embeddings)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         sliding_window = getattr(config, "sliding_window", None)
-        # Support abacusai/Smaug-72B-v0.1 with attention_bias
-        # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
-        # self.self_attn = LlamaAttention(
-        #     hidden_size=self.hidden_size,
-        #     num_heads=config.num_attention_heads,
-        #     num_kv_heads=getattr(config, "num_key_value_heads",
-        #                          config.num_attention_heads),
-        #     rope_theta=rope_theta,
-        #     rope_scaling=rope_scaling,
-        #     max_position_embeddings=max_position_embeddings,
-        #     quant_config=quant_config,
-        #     bias=attention_bias,
-        #     sliding_window=sliding_window,
-        # )
+        
         self.self_attn = HcacheLlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -344,7 +436,7 @@ class LlamaDecoderLayer(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -352,20 +444,79 @@ class LlamaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        hidden_states = self.self_attn(
+        
+        # 传递层索引和上一层hidden states给注意力层
+        hidden_states, current_hidden = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            hidden_cache=kv_cache,
+            kv_cache=kv_cache,
             attn_metadata=attn_metadata,
+            layer_idx=self.layer_idx,
         )
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+        
+        # 返回当前层的hidden states，用于下一层
         return hidden_states, residual
 
 
+# class LlamaModel(nn.Module):
+
+#     def __init__(
+#         self,
+#         config: LlamaConfig,
+#         quant_config: Optional[QuantizationConfig] = None,
+#         lora_config: Optional[LoRAConfig] = None,
+#     ) -> None:
+#         super().__init__()
+#         self.config = config
+#         self.padding_idx = config.pad_token_id
+#         lora_vocab = (lora_config.lora_extra_vocab_size *
+#                       (lora_config.max_loras or 1)) if lora_config else 0
+#         self.vocab_size = config.vocab_size + lora_vocab
+#         self.org_vocab_size = config.vocab_size
+#         self.embed_tokens = VocabParallelEmbedding(
+#             self.vocab_size,
+#             config.hidden_size,
+#             org_num_embeddings=config.vocab_size,
+#         )
+#         self.layers = nn.ModuleList([
+#             LlamaDecoderLayer(config, quant_config)
+#             for _ in range(config.num_hidden_layers)
+#         ])
+#         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+#     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+#         return self.embed_tokens(input_ids)
+
+#     def forward(
+#         self,
+#         input_ids: Optional[torch.Tensor],
+#         positions: torch.Tensor,
+#         kv_caches: List[torch.Tensor],
+#         attn_metadata: AttentionMetadata,
+#         inputs_embeds: Optional[torch.Tensor] = None,
+#     ) -> torch.Tensor:
+#         if inputs_embeds is not None:
+#             hidden_states = inputs_embeds
+#         else:
+#             hidden_states = self.get_input_embeddings(input_ids)
+#         residual = None
+#         for i in range(len(self.layers)):
+#             layer = self.layers[i]
+#             hidden_states, residual = layer(
+#                 positions,
+#                 hidden_states,
+#                 kv_caches[i],
+#                 attn_metadata,
+#                 residual,
+#             )
+#         hidden_states, _ = self.norm(hidden_states, residual)
+#         return hidden_states
+    
 class LlamaModel(nn.Module):
 
     def __init__(
@@ -386,9 +537,10 @@ class LlamaModel(nn.Module):
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
         )
+        # 创建层时传递层索引
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(config, quant_config)
-            for _ in range(config.num_hidden_layers)
+            LlamaDecoderLayer(config, layer_idx=i, quant_config=quant_config)
+            for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -407,16 +559,25 @@ class LlamaModel(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.get_input_embeddings(input_ids)
+        
         residual = None
+        previous_hidden = None  # 初始没有上一层的hidden states
+        
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
+            
+            # 计算当前层应该使用的缓存索引 (每两层共享一个缓存)
+            cache_idx = i // 2
+            
+            # 使用正确的缓存索引，并传递上一层的hidden states
+            hidden_states, residual, current_hidden = layer(
                 positions,
                 hidden_states,
-                kv_caches[i],
+                kv_caches[cache_idx],  # 使用计算出的cache_idx
                 attn_metadata,
                 residual,
             )
+            
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
