@@ -271,22 +271,45 @@ class HcacheLlamaAttention(LlamaAttention):
         # 5. 输出投影
         output, _ = self.o_proj(attn_output)
         
-        # 6. 只有偶数层才存储hidden states到缓存
+        # # 6. 只有偶数层才存储hidden states到缓存
+        # if kv_cache is not None and attn_metadata.slot_mapping is not None and layer_idx % 2 == 0:
+        #     key_cache, value_cache = PagedAttention.split_kv_cache(
+        #         kv_cache, self.num_kv_heads, self.head_dim)
+            
+        #     # 重要：将hidden_states重塑为PagedAttention期望的形状
+        #     # hidden_states已经是[num_tokens, hidden_size]
+        #     # 我们需要将其重塑为[num_tokens, num_kv_heads, head_dim]，与k和v相同
+        #     reshaped_hidden = hidden_states.view(-1, self.num_kv_heads * self.head_dim)
+        #     reshaped_output = output.view(-1, self.num_heads * self.head_dim)
+            
+        #     # 注意：这里我们用相同的hidden_states存储在K和V位置
+        #     # 这样下一层可以用V位置的来计算
+        #     PagedAttention.write_to_paged_cache(
+        #         reshaped_hidden,  # 当前层hidden states
+        #         reshaped_output,  # 同样是当前层hidden states
+        #         key_cache,
+        #         value_cache,
+        #         attn_metadata.slot_mapping,
+        #         attn_metadata.kv_cache_dtype,
+        #         1.0
+        #     )
+        # 在 HcacheLlamaAttention.forward 方法中
+
+        # 在 HcacheLlamaAttention.forward 方法中
+
         if kv_cache is not None and attn_metadata.slot_mapping is not None and layer_idx % 2 == 0:
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_dim)
             
-            # 重要：将hidden_states重塑为PagedAttention期望的形状
-            # hidden_states已经是[num_tokens, hidden_size]
-            # 我们需要将其重塑为[num_tokens, num_kv_heads, head_dim]，与k和v相同
-            reshaped_hidden = hidden_states.view(-1, self.num_kv_heads * self.head_dim)
-            reshaped_output = output.view(-1, self.num_heads * self.head_dim)
+            # 将hidden_states按照注意力头数重塑为PagedAttention期望的形状
+            # 改为按照模型的num_kv_heads和head_dim重塑张量
+            hidden_reshaped = hidden_states.view(-1, self.num_kv_heads, self.head_dim)
+            output_reshaped = output.view(-1, self.num_kv_heads, self.head_dim)
             
-            # 注意：这里我们用相同的hidden_states存储在K和V位置
-            # 这样下一层可以用V位置的来计算
+            # 现在用正确维度的张量调用write_to_paged_cache
             PagedAttention.write_to_paged_cache(
-                reshaped_hidden,  # 当前层hidden states
-                reshaped_output,  # 同样是当前层hidden states
+                hidden_reshaped,  # 形状为[num_tokens, num_kv_heads, head_dim]
+                output_reshaped,  # 形状为[num_tokens, num_kv_heads, head_dim]
                 key_cache,
                 value_cache,
                 attn_metadata.slot_mapping,
@@ -436,7 +459,7 @@ class LlamaDecoderLayer(nn.Module):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -446,7 +469,7 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states, residual)
         
         # 传递层索引和上一层hidden states给注意力层
-        hidden_states, current_hidden = self.self_attn(
+        hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
@@ -561,7 +584,6 @@ class LlamaModel(nn.Module):
             hidden_states = self.get_input_embeddings(input_ids)
         
         residual = None
-        previous_hidden = None  # 初始没有上一层的hidden states
         
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -570,7 +592,7 @@ class LlamaModel(nn.Module):
             cache_idx = i // 2
             
             # 使用正确的缓存索引，并传递上一层的hidden states
-            hidden_states, residual, current_hidden = layer(
+            hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 kv_caches[cache_idx],  # 使用计算出的cache_idx
