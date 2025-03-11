@@ -139,11 +139,13 @@ class HiddenStateCacheEngine(CacheEngine):
         
         logger.info(f"Allocating hidden states cache with shape {kv_shape} on {device}")
         
+        
         pin_memory = is_pin_memory_available() if device == "cpu" else False
         
         # 每两层共享一个缓存
         num_caches = (self.num_layers + 1) // 2  # 向上取整，确保奇数层情况也正确处理
-        
+        print(f'kv_shape in engine: {kv_shape}')
+        print(f'num_caches in engine: {num_caches}')
         hidden_cache: List[torch.Tensor] = []
         for _ in range(num_caches):
             hidden_cache.append(

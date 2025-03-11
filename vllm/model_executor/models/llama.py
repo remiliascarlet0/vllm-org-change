@@ -235,13 +235,13 @@ class HcacheLlamaAttention(LlamaAttention):
         # 1. 计算当前token的QKV
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+        print(f'q shape in llama_attention: {q.shape}, k shape in llama_attention: {k.shape}, v shape in llama_attention: {v.shape}')
         # 2. 从缓存计算历史KV
         computed_kv = None
         if kv_cache is not None:
             key_cache, value_cache = PagedAttention.split_kv_cache(
                 kv_cache, self.num_kv_heads, self.head_dim)
-            
+            print(f'hcache has been split! key_cache shape in attention: {key_cache.shape}, value_cache shape in attention: {value_cache.shape}')
             # 根据层索引选择正确的缓存
             # 偶数层的hidden states存在K位置，奇数层存在V位置
             hidden_cache = key_cache if layer_idx % 2 == 0 else value_cache
@@ -270,30 +270,6 @@ class HcacheLlamaAttention(LlamaAttention):
         
         # 5. 输出投影
         output, _ = self.o_proj(attn_output)
-        
-        # # 6. 只有偶数层才存储hidden states到缓存
-        # if kv_cache is not None and attn_metadata.slot_mapping is not None and layer_idx % 2 == 0:
-        #     key_cache, value_cache = PagedAttention.split_kv_cache(
-        #         kv_cache, self.num_kv_heads, self.head_dim)
-            
-        #     # 重要：将hidden_states重塑为PagedAttention期望的形状
-        #     # hidden_states已经是[num_tokens, hidden_size]
-        #     # 我们需要将其重塑为[num_tokens, num_kv_heads, head_dim]，与k和v相同
-        #     reshaped_hidden = hidden_states.view(-1, self.num_kv_heads * self.head_dim)
-        #     reshaped_output = output.view(-1, self.num_heads * self.head_dim)
-            
-        #     # 注意：这里我们用相同的hidden_states存储在K和V位置
-        #     # 这样下一层可以用V位置的来计算
-        #     PagedAttention.write_to_paged_cache(
-        #         reshaped_hidden,  # 当前层hidden states
-        #         reshaped_output,  # 同样是当前层hidden states
-        #         key_cache,
-        #         value_cache,
-        #         attn_metadata.slot_mapping,
-        #         attn_metadata.kv_cache_dtype,
-        #         1.0
-        #     )
-        # 在 HcacheLlamaAttention.forward 方法中
 
         # 在 HcacheLlamaAttention.forward 方法中
 
@@ -316,7 +292,8 @@ class HcacheLlamaAttention(LlamaAttention):
                 attn_metadata.kv_cache_dtype,
                 1.0
             )
-        
+            print(f'successful in writing cache in layer:{layer_idx},hidden_reshaped shape: {hidden_reshaped.shape}, output_reshaped shape: {output_reshaped.shape}')
+            print(f'successful in writing cache in layer:{layer_idx},key_cache shape: {key_cache.shape}, value_cache shape: {value_cache.shape}')
         return output
 
 
